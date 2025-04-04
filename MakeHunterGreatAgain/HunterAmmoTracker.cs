@@ -1,10 +1,16 @@
-﻿using UnityEngine;
+﻿// File: HunterAmmoTracker.cs
+using UnityEngine;
 using Photon.Pun;
 using System.Reflection;
 using HarmonyLib;
 
 namespace HunterMod
 {
+    /// <summary>
+    /// Tracks ammo, reload state, and other mod-specific behaviors for a Hunter enemy.
+    /// Implements IPunObservable for multiplayer state synchronization.
+    /// Holds the per-instance timer for the wander sound.
+    /// </summary>
     public class HunterAmmoTracker : MonoBehaviourPunCallbacks, IPunObservable
     {
         private PhotonView pv; // Cached PhotonView for network operations
@@ -33,7 +39,10 @@ namespace HunterMod
         public int minigunShotsRemaining = 0;         // MasterClient tracks internally
         public float minigunShotTimer = 0f;           // MasterClient tracks internally
         private bool isInterruptedInternal = false;   // Derived from timer, Synced via IPunObservable
-        // --- End State Variables ---
+
+        // *** Wander Sound Timer (Local Only) ***
+        public float wanderSoundTimer = 0f;
+        // *** END Wander Timer ***
 
         // --- Properties (Reflect the current state) ---
         public bool IsReloading => isReloading;
@@ -65,19 +74,24 @@ namespace HunterMod
                 }
             }
 
-            if (pv == null)
+            if (pv == null) { Plugin.LogErrorF($"HunterAmmoTracker on {gameObject.name} could NOT find a PhotonView! Mod features requiring network sync will fail."); }
+            else { Plugin.LogDebugF($"HunterAmmoTracker on {gameObject.name} found PhotonView: {pv.ViewID}"); }
+
+            // Initialize wander sound timer randomly if feature enabled in Plugin
+            // Use safety checks for potentially unloaded config during Awake
+            if (Plugin.EnableWanderSound != null && Plugin.EnableWanderSound.Value)
             {
-                Plugin.LogErrorF($"HunterAmmoTracker on {gameObject.name} could NOT find a PhotonView! Mod features requiring network sync will fail.");
-            }
-            else
-            {
-                Plugin.LogDebugF($"HunterAmmoTracker on {gameObject.name} found PhotonView: {pv.ViewID}");
+                float min = Plugin.WanderSoundMinInterval?.Value ?? 3f;
+                float max = Plugin.WanderSoundMaxInterval?.Value ?? 6f;
+                if (min <= max) { wanderSoundTimer = Random.Range(min * 0.5f, max); } // Start with random delay
+                else { wanderSoundTimer = 3f; } // Default if range invalid
+                Plugin.LogDebugF($"Hunter {GetHunterName()} initialized wander timer to {wanderSoundTimer:F2}s");
             }
         }
 
         void Update()
         {
-            // Only the MasterClient authoritatively updates timers that change state
+            // MasterClient authoritative timer logic for reload/interrupt
             if (pv != null && pv.IsMine)
             {
                 // Update Interrupt Timer
@@ -87,7 +101,6 @@ namespace HunterMod
                     if (damageInterruptDelayTimer <= 0f)
                     {
                         damageInterruptDelayTimer = 0f;
-                        // State change (isInterruptedInternal becomes false) synced via OnPhotonSerializeView
                         Plugin.LogInfoF($"Hunter {GetHunterName()} damage interrupt delay finished (Master).");
                     }
                 }
@@ -98,7 +111,6 @@ namespace HunterMod
                     currentReloadTimer -= Time.deltaTime;
                     if (currentReloadTimer <= 0f)
                     {
-                        // Stop reloading state change synced via OnPhotonSerializeView
                         isReloading = false;
                         currentReloadTimer = 0f;
                         Plugin.LogInfoF($"Hunter {GetHunterName()} finished reloading (Master) (Skill: {currentSkill}).");
@@ -106,8 +118,10 @@ namespace HunterMod
                 }
             }
 
-            // Clients (and Master) update the derived internal flag locally for immediate checks
+            // Update internal interrupted flag derived from timer (runs on all clients)
             isInterruptedInternal = damageInterruptDelayTimer > 0f;
+
+            // Wander sound timer logic is handled within HunterPatches state prefixes
         }
 
         /// <summary>
@@ -120,11 +134,12 @@ namespace HunterMod
                 stream.SendNext(isReloading);
                 stream.SendNext(currentTotalAmmo);
                 stream.SendNext(isOutOfAmmoPermanently);
-                stream.SendNext(isInterruptedInternal); // Send the derived boolean state
+                stream.SendNext(isInterruptedInternal);
                 stream.SendNext(isMinigunBurstActive);
             }
             else // Clients receive data
             {
+                // Read data in the same order it was sent
                 this.isReloading = (bool)stream.ReceiveNext();
                 this.currentTotalAmmo = (int)stream.ReceiveNext();
                 this.isOutOfAmmoPermanently = (bool)stream.ReceiveNext();
@@ -132,7 +147,6 @@ namespace HunterMod
                 this.isMinigunBurstActive = (bool)stream.ReceiveNext();
 
                 // Update local timers based on received state for better client-side prediction
-                // Note: This doesn't perfectly sync the *exact* timer value, but ensures states match.
                 if (!this.isReloading) this.currentReloadTimer = 0f;
                 if (!this.isInterruptedInternal) this.damageInterruptDelayTimer = 0f;
             }
@@ -140,13 +154,10 @@ namespace HunterMod
 
         /// <summary>
         /// [MasterClient Only] Attempts to decrement the total ammo count, if enabled.
-        /// Sets the permanent out-of-ammo flag if necessary.
-        /// State changes are synced via IPunObservable.
         /// </summary>
-        /// <returns>True if the Hunter had ammo for this shot, False if out of ammo.</returns>
         public bool TryDecrementTotalAmmo()
         {
-            // Clients just check their synced state via HasTotalAmmo property
+            // Clients just rely on the synced HasTotalAmmo property for checks
             if (pv == null || !pv.IsMine) return HasTotalAmmo;
 
             // --- MasterClient Authoritative Logic ---
@@ -162,7 +173,7 @@ namespace HunterMod
                     bool lastStandIsActive = Plugin.IsRepoLastStandActive();
                     if (!lastStandIsActive)
                     {
-                        isOutOfAmmoPermanently = true; // Master sets state
+                        isOutOfAmmoPermanently = true; // Master sets state (synced via IPunObservable)
                         Plugin.LogErrorF($"Hunter {GetHunterName()} HAS RUN OUT OF TOTAL AMMO (Master)! Perm Leave.");
                         CancelActions(); // Stop reload/burst locally on Master
                         return false; // Ran out this shot
@@ -171,8 +182,7 @@ namespace HunterMod
                     {
                         Plugin.LogWarningF($"Hunter {GetHunterName()} ammo reached 0 (Master), but Last Stand IS Active. Not setting OOA flag.");
                         CancelActions();
-                        // Still return true here because the shot was allowed, and perm OOA is prevented.
-                        // Future shots will be blocked by HasTotalAmmo check.
+                        // Still return true: shot was allowed, perm OOA prevented by Last Stand
                     }
                 }
                 return true; // Ammo used successfully
@@ -182,7 +192,7 @@ namespace HunterMod
                 bool lastStandIsActive = Plugin.IsRepoLastStandActive();
                 if (!isOutOfAmmoPermanently && !lastStandIsActive) // Ensure OOA state is set if needed
                 {
-                    isOutOfAmmoPermanently = true;
+                    isOutOfAmmoPermanently = true; // Master sets state (synced via IPunObservable)
                     Plugin.LogErrorF($"Hunter {GetHunterName()} WAS ALREADY OOA (Master)! Force Perm Leave state.");
                 }
                 else if (!isOutOfAmmoPermanently && lastStandIsActive)
@@ -194,13 +204,11 @@ namespace HunterMod
         }
 
         /// <summary>
-        /// [MasterClient Only] Starts the reload process based on the Hunter's skill, if possible.
-        /// Sends an RPC to inform clients. State changes synced via IPunObservable.
+        /// [MasterClient Only] Starts the reload process.
         /// </summary>
         public void StartReload()
         {
-            if (pv == null || !pv.IsMine) return; // Only MasterClient initiates reload
-
+            if (pv == null || !pv.IsMine) return;
             // Check conditions locally on MasterClient first
             if (isOutOfAmmoPermanently) { Plugin.LogDebugF($"StartReload blocked (Master): Hunter {GetHunterName()} permanently OOA."); return; }
             if (damageInterruptDelayTimer > 0f) { Plugin.LogDebugF($"StartReload blocked (Master): Hunter {GetHunterName()} Interrupt Delay ({damageInterruptDelayTimer:F1}s)."); return; }
@@ -208,7 +216,7 @@ namespace HunterMod
 
             if (!isReloading) // Check Master's state
             {
-                isReloading = true; // Set state locally on Master
+                isReloading = true; // Set state locally on Master (synced via IPunObservable)
                 float actualReloadTime;
                 switch (currentSkill)
                 {
@@ -218,29 +226,23 @@ namespace HunterMod
                     default: actualReloadTime = ConfiguredMediumReloadTime; Plugin.LogWarningF($"Hunter {GetHunterName()} unknown skill '{currentSkill}', defaulting Medium."); break;
                 }
                 currentReloadTimer = actualReloadTime; // Start timer locally on Master
-
                 Plugin.LogInfoF($"Hunter {GetHunterName()} started reload (Master) (Skill: {currentSkill}, Time: {actualReloadTime:F1}s).");
 
-                // Send RPC to clients to update their local timers for better prediction/responsiveness
-                // The core 'isReloading' state is handled by OnPhotonSerializeView
+                // Send RPC to clients to update their local timers for better prediction
                 pv.RPC(nameof(StartReloadRPC), RpcTarget.Others, actualReloadTime);
             }
             else { Plugin.LogWarningF($"Hunter {GetHunterName()} tried StartReload (Master) but was already reloading."); }
         }
 
         /// <summary>
-        /// [Called via RPC on Clients] Updates client's local timer when reload starts for prediction.
+        /// [RPC on Clients] Updates local timer prediction.
         /// </summary>
         [PunRPC]
         private void StartReloadRPC(float reloadDuration)
         {
             if (pv == null || pv.IsMine) return; // Ignore if Master or no PV
-
-            // Note: isReloading state itself is synced via OnPhotonSerializeView
-            // This RPC primarily helps sync the *timer* start for smoother client prediction
-            // If OnPhotonSerializeView sets isReloading=true *before* this RPC, this ensures timer is set.
-            // If this RPC arrives first, timer starts, and OnPhotonSerializeView confirms isReloading.
-            if (isReloading) // Only set timer if we know we should be reloading
+                                                 // Only update local timer if the synced state confirms we should be reloading
+            if (isReloading)
             {
                 currentReloadTimer = reloadDuration;
             }
@@ -249,136 +251,99 @@ namespace HunterMod
 
 
         /// <summary>
-        /// [MasterClient Only] Applies the damage interrupt logic if enabled and applicable.
-        /// Sends an RPC to inform clients. State changes synced via IPunObservable.
+        /// [MasterClient Only] Applies damage interrupt.
         /// </summary>
         public void ApplyDamageInterrupt()
         {
-            if (pv == null || !pv.IsMine) return; // Only Master can interrupt
-
+            if (pv == null || !pv.IsMine) return;
             if (isOutOfAmmoPermanently || !ConfigEnableDamageInterrupt) return;
 
             if (isReloading) // Check Master's authoritative state
             {
-                isReloading = false; // Update state locally on Master
+                isReloading = false; // Update state locally on Master (synced via IPunObservable)
                 currentReloadTimer = 0f;
                 damageInterruptDelayTimer = ConfigDamageInterruptDelay; // Start interrupt timer on Master
+                // isInterruptedInternal becomes true implicitly, synced via IPunObservable
 
                 Plugin.LogInfoF($"Hunter {GetHunterName()} hurt during reload (Master)! Reload cancelled, starting {ConfigDamageInterruptDelay:F1}s interrupt delay.");
 
                 // Send RPC to clients to sync the interrupt delay timer start
                 pv.RPC(nameof(InterruptReloadRPC), RpcTarget.Others, ConfigDamageInterruptDelay);
             }
-            // Potential future extension: Interrupt minigun burst here as well
         }
 
         /// <summary>
-        /// [Called via RPC on Clients] Updates client's local interrupt timer for prediction.
+        /// [RPC on Clients] Updates local timer prediction.
         /// </summary>
         [PunRPC]
         private void InterruptReloadRPC(float interruptDuration)
         {
             if (pv == null || pv.IsMine) return; // Ignore if Master or no PV
 
-            // Similar to StartReloadRPC, this helps sync the timer start.
-            // The core state change (isReloading=false, isInterruptedInternal=true) comes via OnPhotonSerializeView.
-            // This ensures the client's local timer reflects the interrupt duration.
-            damageInterruptDelayTimer = interruptDuration;
+            damageInterruptDelayTimer = interruptDuration; // Start local interrupt timer
             isInterruptedInternal = true; // Update derived flag locally immediately
-
-            // Reset reload timer locally if needed, though OnPhotonSerializeView should handle isReloading=false
-            if (!isReloading) currentReloadTimer = 0f;
+            if (!isReloading) currentReloadTimer = 0f; // Ensure local reload timer is stopped
 
             Plugin.LogDebugF($"Hunter {GetHunterName()} received InterruptReloadRPC (Delay: {interruptDuration:F1}s).");
         }
 
         /// <summary>
-        /// [MasterClient Only] Sets the initial synchronized state (Skill, Ammo) for this Hunter.
-        /// Sends a buffered RPC so late-joining players also receive this state.
+        /// [MasterClient Only] Sets initial state and syncs via RPC.
         /// </summary>
         public void NetworkInitialize(ReloadSkill skill, int totalAmmo)
         {
             if (pv == null || !pv.IsMine) return;
+            // Set initial authoritative state
+            this.currentSkill = skill; this.currentTotalAmmo = totalAmmo; this.isOutOfAmmoPermanently = false; this.isReloading = false; this.isMinigunBurstActive = false; this.damageInterruptDelayTimer = 0f; this.isInterruptedInternal = false;
 
-            // Set initial state locally on Master
-            this.currentSkill = skill;
-            this.currentTotalAmmo = totalAmmo;
-            this.isOutOfAmmoPermanently = false;
-            this.isReloading = false;
-            this.isMinigunBurstActive = false;
-            this.damageInterruptDelayTimer = 0f;
-            this.isInterruptedInternal = false;
+            // Initialize wander timer randomly on Master
+            float min = Plugin.WanderSoundMinInterval?.Value ?? 3f; float max = Plugin.WanderSoundMaxInterval?.Value ?? 6f; if (min > max) min = max;
+            this.wanderSoundTimer = Random.Range(min * 0.5f, max);
 
-            // Send buffered RPC to set initial state on all other clients (including future joiners)
+            // Send buffered RPC to set initial state on all other clients
             pv.RPC(nameof(SyncInitialStateRPC), RpcTarget.OthersBuffered, (int)skill, totalAmmo);
             Plugin.LogInfoF($"Hunter {GetHunterName()} initialized (Master) - Skill: {skill}, Ammo: {totalAmmo}");
         }
 
         /// <summary>
-        /// [Called via RPC on Clients, including late joiners] Sets the initial synced state.
+        /// [RPC on Clients] Sets initial synced state.
         /// </summary>
         [PunRPC]
         private void SyncInitialStateRPC(int skillIndex, int totalAmmo)
         {
-            if (pv == null || pv.IsMine) return; // Master already initialized
+            if (pv == null || pv.IsMine) return;
+            // Set initial client state based on RPC
+            this.currentSkill = (ReloadSkill)skillIndex; this.currentTotalAmmo = totalAmmo; this.isOutOfAmmoPermanently = false; this.isReloading = false; this.isMinigunBurstActive = false; this.damageInterruptDelayTimer = 0f; this.isInterruptedInternal = false;
 
-            this.currentSkill = (ReloadSkill)skillIndex;
-            this.currentTotalAmmo = totalAmmo;
-            // Reset other states to default initial values
-            this.isOutOfAmmoPermanently = false;
-            this.isReloading = false;
-            this.isMinigunBurstActive = false;
-            this.damageInterruptDelayTimer = 0f;
-            this.isInterruptedInternal = false;
+            // Initialize wander timer randomly on Client
+            float min = Plugin.WanderSoundMinInterval?.Value ?? 3f; float max = Plugin.WanderSoundMaxInterval?.Value ?? 6f; if (min > max) min = max;
+            this.wanderSoundTimer = Random.Range(min * 0.5f, max);
+
             Plugin.LogInfoF($"Hunter {GetHunterName()} received SyncInitialStateRPC - Skill: {currentSkill}, Ammo: {totalAmmo}");
         }
 
-        /// <summary> [MasterClient Only] Initializes the state for a minigun burst. Synced via IPunObservable. </summary>
+        /// <summary> [MasterClient Only] Initializes minigun burst state. </summary>
         public void InitializeMinigunBurst()
         {
             if (pv == null || !pv.IsMine) return;
-
-            if (!isMinigunBurstActive)
-            {
-                isMinigunBurstActive = true; // Master sets state
-                minigunShotsRemaining = ConfigMinigunShots;
-                minigunShotTimer = 0f; // Fire first shot immediately on Master's next check
-                Plugin.LogInfoF($"Hunter {GetHunterName()} initializing minigun burst (Master) ({minigunShotsRemaining} shots).");
-                // isMinigunBurstActive flag is synced via OnPhotonSerializeView
-            }
+            if (!isMinigunBurstActive) { isMinigunBurstActive = true; minigunShotsRemaining = ConfigMinigunShots; minigunShotTimer = 0f; Plugin.LogInfoF($"Hunter {GetHunterName()} initializing minigun burst (Master) ({minigunShotsRemaining} shots)."); }
         }
 
-        /// <summary> [MasterClient Only] Cleans up the minigun burst state. Synced via IPunObservable. </summary>
+        /// <summary> [MasterClient Only] Ends minigun burst state. </summary>
         public void EndMinigunBurst()
         {
             if (pv == null || !pv.IsMine) return;
-
-            if (isMinigunBurstActive)
-            {
-                isMinigunBurstActive = false; // Master sets state
-                minigunShotsRemaining = 0;
-                minigunShotTimer = 0f;
-                Plugin.LogInfoF($"Hunter {GetHunterName()} minigun burst ended/cancelled (Master).");
-                // isMinigunBurstActive flag change is synced via OnPhotonSerializeView
-            }
+            if (isMinigunBurstActive) { isMinigunBurstActive = false; minigunShotsRemaining = 0; minigunShotTimer = 0f; Plugin.LogInfoF($"Hunter {GetHunterName()} minigun burst ended/cancelled (Master)."); }
         }
-
 
         // --- Helper methods ---
         /// <summary> Gets the remaining reload time based on the local timer. </summary>
         public float GetRemainingReloadTime() { return !isReloading ? 0f : currentReloadTimer; }
 
         /// <summary> [MasterClient Only] Helper to stop current actions like reloading or minigun burst. </summary>
-        private void CancelActions()
-        {
-            if (pv == null || !pv.IsMine) return;
-            isReloading = false;
-            currentReloadTimer = 0f;
-            EndMinigunBurst(); // Ensure minigun stops if active
-        }
+        private void CancelActions() { if (pv == null || !pv.IsMine) return; isReloading = false; currentReloadTimer = 0f; EndMinigunBurst(); }
 
         /// <summary> Helper to get a clean game object name for logging. </summary>
         private string GetHunterName() => gameObject?.name ?? "Unknown Hunter";
-        // --- End Helper methods ---
     }
 }
