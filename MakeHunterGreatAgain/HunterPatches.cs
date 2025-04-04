@@ -1,7 +1,7 @@
 ﻿// File: HunterPatches.cs
 using HarmonyLib;
 using UnityEngine;
-using UnityEngine.AI;
+using UnityEngine.AI; // Required for NavMeshAgent
 using System.Reflection;
 using System.Collections.Generic;
 using Photon.Pun;
@@ -15,11 +15,30 @@ namespace HunterMod
         private static Dictionary<int, int> stateLeaveFailCounters = new Dictionary<int, int>();
         private const int MAX_LEAVE_FAILURES_WHILE_RELOADING = 5;
 
+        // Reflection fields cache for performance
+        private static FieldInfo horizontalAimTargetField = AccessTools.Field(typeof(EnemyHunter), "horizontalAimTarget");
+        private static FieldInfo investigateAimVerticalField = AccessTools.Field(typeof(EnemyHunter), "investigateAimVertical");
+        // Cache field info for EnemyNavMeshAgent.AgentVelocity
+        private static FieldInfo agentVelocityField = AccessTools.Field(typeof(EnemyNavMeshAgent), "AgentVelocity");
+
         // --- GetEnemyNavMeshAgent ---
         private static EnemyNavMeshAgent GetEnemyNavMeshAgent(EnemyHunter instance)
         {
             if (instance?.enemy == null) { Plugin.LogErrorF("GetEnemyNavMeshAgent: Instance or instance.enemy is null!"); return null; }
-            try { FieldInfo navAgentField = AccessTools.Field(typeof(Enemy), "NavMeshAgent"); if (navAgentField != null) { object navAgentObject = navAgentField.GetValue(instance.enemy); return navAgentObject as EnemyNavMeshAgent; } else { Plugin.LogErrorF($"GetEnemyNavMeshAgent: Could not find Field 'NavMeshAgent' on type 'Enemy' for {instance.gameObject.name}!"); return null; } }
+            try
+            {
+                FieldInfo navAgentField = AccessTools.Field(typeof(Enemy), "NavMeshAgent");
+                if (navAgentField != null)
+                {
+                    object navAgentObject = navAgentField.GetValue(instance.enemy);
+                    return navAgentObject as EnemyNavMeshAgent;
+                }
+                else
+                {
+                    Plugin.LogErrorF($"GetEnemyNavMeshAgent: Could not find Field 'NavMeshAgent' on type 'Enemy' for {instance.gameObject.name}!");
+                    return null;
+                }
+            }
             catch (System.Exception ex) { Plugin.LogErrorF($"GetEnemyNavMeshAgent: Error accessing 'NavMeshAgent' field on {instance.gameObject.name}: {ex.Message}"); return null; }
         }
 
@@ -44,90 +63,22 @@ namespace HunterMod
         }
 
 
-        // --- Helper Method to Handle Wander Sound Logic (Runs Locally) ---
+        // --- Helper Method to Handle Wander Sound Logic ---
         private static void HandleWanderSound(EnemyHunter instance, HunterAmmoTracker tracker)
         {
-            // Check if feature enabled, clip loaded, and tracker exists
-            if (tracker == null || !Plugin.EnableWanderSound.Value || Plugin.LoadedWanderAudioClip == null)
-            {
-                return;
-            }
-
-            // Tick down the local timer
+            if (tracker == null || !Plugin.EnableWanderSound.Value || Plugin.LoadedWanderAudioClip == null) return;
             tracker.wanderSoundTimer -= Time.deltaTime;
-
             if (tracker.wanderSoundTimer <= 0f)
             {
-                Sound borrowedSound = null; // Keep track for restoration in finally block
-                AudioClip[] originalClips = null;
-                float originalVolume = 0f;
-                float originalVolumeRand = 0f;
-                float originalPitch = 1f;
-                float originalPitchRand = 0f;
-                AudioManager.AudioType originalType = AudioManager.AudioType.Default; // Store original Type
-
                 try
                 {
-                    EnemyHunterAnim anim = instance.enemyHunterAnim;
-                    if (anim == null) anim = instance.GetComponentInChildren<EnemyHunterAnim>();
-                    if (anim == null) { Plugin.LogErrorF($"Could not find EnemyHunterAnim component for {instance.gameObject.name} to play wander sound."); tracker.wanderSoundTimer = 5f; return; }
-
-                    string borrowTargetName = Plugin.WanderSoundBorrowTarget.Value;
-                    FieldInfo soundField = AccessTools.Field(typeof(EnemyHunterAnim), borrowTargetName);
-                    if (soundField == null) { Plugin.LogWarningF($"Could not find Sound field '{borrowTargetName}' on EnemyHunterAnim. Using 'soundFootstepShort' as fallback."); soundField = AccessTools.Field(typeof(EnemyHunterAnim), "soundFootstepShort"); if (soundField == null) { Plugin.LogErrorF($"Could not find fallback 'soundFootstepShort' field either. Cannot play wander sound."); tracker.wanderSoundTimer = 5f; return; } }
-
-                    borrowedSound = soundField.GetValue(anim) as Sound;
-                    if (borrowedSound == null) { Plugin.LogErrorF($"Borrowed Sound object ('{borrowTargetName}' or fallback) is null for {instance.gameObject.name}. Cannot play wander sound."); tracker.wanderSoundTimer = 5f; return; }
-
-                    // Store original settings BEFORE modifying
-                    originalClips = borrowedSound.Sounds;
-                    originalVolume = borrowedSound.Volume;
-                    originalVolumeRand = borrowedSound.VolumeRandom;
-                    originalPitch = borrowedSound.Pitch;
-                    originalPitchRand = borrowedSound.PitchRandom;
-                    originalType = borrowedSound.Type; // Store original type
-
-                    // --- Temporarily override settings ---
-                    // *** ENSURE WE DO NOT OVERRIDE THE TYPE TO GLOBAL ***
-                    // The sound will play with the 3D settings of originalType (e.g., Footstep)
-                    borrowedSound.Volume = Plugin.WanderSoundVolume.Value; // Set volume from config
-                    borrowedSound.VolumeRandom = 0f; // Disable random volume variation
-                    borrowedSound.Pitch = 1f;        // Set fixed pitch
-                    borrowedSound.PitchRandom = 0f;  // Disable random pitch variation
-                    borrowedSound.Sounds = new AudioClip[] { Plugin.LoadedWanderAudioClip }; // Set our custom clip
-
-                    // Play the sound using the game's system
-                    borrowedSound.Play(instance.transform.position);
-                    Plugin.LogDebugF($"Played wander sound for {instance.gameObject.name} using borrowed sound field '{soundField.Name}' with original type '{originalType}'");
-
+                    AudioSource.PlayClipAtPoint(Plugin.LoadedWanderAudioClip, instance.transform.position, Plugin.WanderSoundVolume.Value);
+                    Plugin.LogDebugF($"Played wander sound for {instance.gameObject.name} using PlayClipAtPoint");
                 }
-                catch (Exception ex)
-                {
-                    Plugin.LogErrorF($"Error playing wander sound: {ex}");
-                }
-                finally // Use finally block to ENSURE restoration
-                {
-                    if (borrowedSound != null)
-                    {
-                        // Restore original settings using captured values
-                        borrowedSound.Sounds = originalClips;
-                        borrowedSound.Volume = originalVolume;
-                        borrowedSound.VolumeRandom = originalVolumeRand;
-                        borrowedSound.Pitch = originalPitch;
-                        borrowedSound.PitchRandom = originalPitchRand;
-                        borrowedSound.Type = originalType; // Restore original type
-                        // Plugin.LogDebugF($"Restored borrowed sound '{borrowTargetName}' to original settings."); // Optional log
-                    }
-                }
-                // --- End Play Logic ---
-
-                // Reset the timer to a new random interval
-                float min = Plugin.WanderSoundMinInterval.Value;
-                float max = Plugin.WanderSoundMaxInterval.Value;
-                tracker.wanderSoundTimer = UnityEngine.Random.Range(min, max);
+                catch (Exception ex) { Plugin.LogErrorF($"Error playing wander sound: {ex}"); }
+                float min = Plugin.WanderSoundMinInterval.Value; float max = Plugin.WanderSoundMaxInterval.Value; tracker.wanderSoundTimer = UnityEngine.Random.Range(min, max);
             }
         }
-        // --- End Wander Sound Helper ---
 
 
         [HarmonyPatch("StateIdle")]
@@ -135,9 +86,43 @@ namespace HunterMod
         static bool StateIdlePrefix(EnemyHunter __instance, ref bool ___stateImpulse)
         {
             HunterAmmoTracker tracker = GetOrAddTracker(__instance); if (tracker == null) return true; PhotonView pv = Plugin.GetPhotonView(__instance); if (pv == null) return true;
-            HandleWanderSound(__instance, tracker); // Play sound locally if conditions met
+            HandleWanderSound(__instance, tracker); // Play sound locally
+
             if (tracker.isOutOfAmmoPermanently) { Plugin.LogDebugF($"StateIdlePrefix: Hunter {__instance.gameObject.name} OOA (Synced). Forcing Leave."); if (pv.IsMine) { Plugin.CallUpdateState(__instance, EnemyHunter.State.Leave); stateLeaveFailCounters.Remove(__instance.GetInstanceID()); } return false; }
-            if (Plugin.ShouldRunAwayWhileReloading() && tracker.IsReloading) { Plugin.LogDebugF($"StateIdlePrefix: Hunter {__instance.gameObject.name} reloading (Synced). Moving away."); if (pv.IsMine) { EnemyNavMeshAgent enemyNavAgent = GetEnemyNavMeshAgent(__instance); if (enemyNavAgent != null) { enemyNavAgent.ResetPath(); if (Plugin.FindRetreatPoint(__instance, out Vector3 p)) { enemyNavAgent.SetDestination(p); } } ___stateImpulse = false; } return false; }
+
+            if (Plugin.ShouldRunAwayWhileReloading() && tracker.IsReloading)
+            {
+                Plugin.LogDebugF($"StateIdlePrefix: Hunter {__instance.gameObject.name} reloading (Synced). Moving away.");
+                if (pv.IsMine)
+                {
+                    EnemyNavMeshAgent enemyNavAgentWrapper = GetEnemyNavMeshAgent(__instance);
+                    if (enemyNavAgentWrapper != null)
+                    {
+                        enemyNavAgentWrapper.ResetPath();
+                        if (Plugin.FindRetreatPoint(__instance, out Vector3 p))
+                        {
+                            enemyNavAgentWrapper.SetDestination(p);
+                            // *** MODIFICATION: Use AgentVelocity field via Reflection ***
+                            try
+                            {
+                                if (agentVelocityField != null)
+                                {
+                                    Vector3 currentVelocity = (Vector3)agentVelocityField.GetValue(enemyNavAgentWrapper);
+                                    if (horizontalAimTargetField != null && currentVelocity.sqrMagnitude > 0.01f) { horizontalAimTargetField.SetValue(__instance, Quaternion.LookRotation(currentVelocity.normalized)); }
+                                }
+                                else { Plugin.LogErrorF("StateIdlePrefix: AgentVelocity field info is null!"); }
+
+                                if (investigateAimVerticalField != null) { investigateAimVerticalField.SetValue(__instance, Quaternion.identity); }
+                            }
+                            catch (Exception ex) { Plugin.LogErrorF($"StateIdlePrefix: Error overriding aim target: {ex}"); }
+                            // *** END MODIFICATION ***
+                        }
+                    }
+                    else { Plugin.LogErrorF($"StateIdlePrefix: Failed to get EnemyNavMeshAgent for {__instance.gameObject.name}"); }
+                    ___stateImpulse = false;
+                }
+                return false; // Block original Idle
+            }
             return true;
         }
 
@@ -147,9 +132,43 @@ namespace HunterMod
         static bool StateRoamPrefix(EnemyHunter __instance, ref bool ___stateImpulse)
         {
             HunterAmmoTracker tracker = GetOrAddTracker(__instance); if (tracker == null) return true; PhotonView pv = Plugin.GetPhotonView(__instance); if (pv == null) return true;
-            HandleWanderSound(__instance, tracker); // Play sound locally if conditions met
+            HandleWanderSound(__instance, tracker); // Play sound locally
+
             if (tracker.isOutOfAmmoPermanently) { if (pv.IsMine) { Plugin.CallUpdateState(__instance, EnemyHunter.State.Leave); stateLeaveFailCounters.Remove(__instance.GetInstanceID()); } return false; }
-            if (Plugin.ShouldRunAwayWhileReloading() && tracker.IsReloading) { Plugin.LogDebugF($"StateRoamPrefix: Hunter {__instance.gameObject.name} reloading (Synced). Moving away."); if (pv.IsMine) { EnemyNavMeshAgent enemyNavAgent = GetEnemyNavMeshAgent(__instance); if (enemyNavAgent != null) { enemyNavAgent.ResetPath(); if (Plugin.FindRetreatPoint(__instance, out Vector3 p)) enemyNavAgent.SetDestination(p); } ___stateImpulse = false; } return false; }
+
+            if (Plugin.ShouldRunAwayWhileReloading() && tracker.IsReloading)
+            {
+                Plugin.LogDebugF($"StateRoamPrefix: Hunter {__instance.gameObject.name} reloading (Synced). Moving away.");
+                if (pv.IsMine)
+                {
+                    EnemyNavMeshAgent enemyNavAgentWrapper = GetEnemyNavMeshAgent(__instance);
+                    if (enemyNavAgentWrapper != null)
+                    {
+                        enemyNavAgentWrapper.ResetPath();
+                        if (Plugin.FindRetreatPoint(__instance, out Vector3 p))
+                        {
+                            enemyNavAgentWrapper.SetDestination(p);
+                            // *** MODIFICATION: Use AgentVelocity field via Reflection ***
+                            try
+                            {
+                                if (agentVelocityField != null)
+                                {
+                                    Vector3 currentVelocity = (Vector3)agentVelocityField.GetValue(enemyNavAgentWrapper);
+                                    if (horizontalAimTargetField != null && currentVelocity.sqrMagnitude > 0.01f) { horizontalAimTargetField.SetValue(__instance, Quaternion.LookRotation(currentVelocity.normalized)); }
+                                }
+                                else { Plugin.LogErrorF("StateRoamPrefix: AgentVelocity field info is null!"); }
+
+                                if (investigateAimVerticalField != null) { investigateAimVerticalField.SetValue(__instance, Quaternion.identity); }
+                            }
+                            catch (Exception ex) { Plugin.LogErrorF($"StateRoamPrefix: Error overriding aim target: {ex}"); }
+                            // *** END MODIFICATION ***
+                        }
+                    }
+                    else { Plugin.LogErrorF($"StateRoamPrefix: Failed to get EnemyNavMeshAgent for {__instance.gameObject.name}"); }
+                    ___stateImpulse = false;
+                }
+                return false; // Block original Roam
+            }
             return true;
         }
 
@@ -161,7 +180,7 @@ namespace HunterMod
             HunterAmmoTracker tracker = GetOrAddTracker(__instance); if (tracker == null) return true; PhotonView pv = Plugin.GetPhotonView(__instance); if (pv == null) return true;
             if (tracker.isOutOfAmmoPermanently) { Plugin.LogDebugF($"StateAimPrefix: Hunter {__instance.gameObject.name} OOA (Synced). Forcing Leave."); if (pv.IsMine) { Plugin.CallUpdateState(__instance, EnemyHunter.State.Leave); stateLeaveFailCounters.Remove(__instance.GetInstanceID()); } return false; }
             bool blockAimProgression = tracker.IsReloading || tracker.IsInterrupted || !tracker.HasTotalAmmo;
-            if (blockAimProgression) { string reason = !tracker.HasTotalAmmo ? "OOA" : (tracker.IsReloading ? $"reloading" : $"interrupted"); Plugin.LogDebugF($"StateAimPrefix BLOCKED: {__instance.gameObject.name} is {reason} (Synced)."); if (pv.IsMine) { if (Plugin.ShouldRunAwayWhileReloading() && tracker.IsReloading) { Plugin.LogDebugF($"StateAimPrefix (Master): {__instance.gameObject.name} running away."); EnemyNavMeshAgent enemyNavAgent = GetEnemyNavMeshAgent(__instance); if (enemyNavAgent != null) { enemyNavAgent.ResetPath(); if (Plugin.FindRetreatPoint(__instance, out Vector3 p)) enemyNavAgent.SetDestination(p); } else Plugin.LogErrorF($"StateAimPrefix (Master): EnemyNavMeshAgent missing!"); } else { Plugin.CallAimLogic(__instance); } if (___stateTimer <= Time.deltaTime) ___stateTimer = 0.1f; } Plugin.CallAimLogic(__instance); if (___stateTimer <= Time.deltaTime) ___stateTimer = 0.1f; return false; }
+            if (blockAimProgression) { string reason = !tracker.HasTotalAmmo ? "OOA" : (tracker.IsReloading ? $"reloading" : $"interrupted"); Plugin.LogDebugF($"StateAimPrefix BLOCKED: {__instance.gameObject.name} is {reason} (Synced)."); if (pv.IsMine) { if (Plugin.ShouldRunAwayWhileReloading() && tracker.IsReloading) { Plugin.LogDebugF($"StateAimPrefix (Master): {__instance.gameObject.name} running away."); EnemyNavMeshAgent enemyNavAgent = GetEnemyNavMeshAgent(__instance); if (enemyNavAgent != null) { enemyNavAgent.ResetPath(); if (Plugin.FindRetreatPoint(__instance, out Vector3 p)) { enemyNavAgent.SetDestination(p); /* Aim Override during retreat happens in Idle/Roam */ } } else Plugin.LogErrorF($"StateAimPrefix (Master): EnemyNavMeshAgent missing!"); } else { Plugin.CallAimLogic(__instance); } if (___stateTimer <= Time.deltaTime) ___stateTimer = 0.1f; } Plugin.CallAimLogic(__instance); if (___stateTimer <= Time.deltaTime) ___stateTimer = 0.1f; return false; }
             return true;
         }
 
@@ -171,15 +190,10 @@ namespace HunterMod
         static bool StateShootPrefix(EnemyHunter __instance, ref float ___stateTimer)
         {
             HunterAmmoTracker tracker = GetOrAddTracker(__instance); if (tracker == null) return true; PhotonView pv = Plugin.GetPhotonView(__instance); if (pv == null) return true;
-            if (!pv.IsMine) { Plugin.CallAimLogic(__instance); return false; } // Clients always block original
-
-            // --- MasterClient Authoritative Logic ---
+            if (!pv.IsMine) { Plugin.CallAimLogic(__instance); return false; }
             if (!tracker.HasTotalAmmo) { Plugin.LogErrorF($"StateShootPrefix (Master): {__instance.gameObject.name} OOA! Forcing Leave."); if (!tracker.isOutOfAmmoPermanently && !Plugin.IsRepoLastStandActive()) { tracker.isOutOfAmmoPermanently = true; } Plugin.CallUpdateState(__instance, EnemyHunter.State.Leave); stateLeaveFailCounters.Remove(__instance.GetInstanceID()); return false; }
-
-            // --- Standard Shoot Logic (Minigun OFF) ---
-            if (!Plugin.IsMinigunModeEnabled()) { if (!tracker.TryDecrementTotalAmmo()) { Plugin.LogInfoF($"StateShootPrefix(N) (Master): {__instance.gameObject.name} OOA this shot. Forcing Leave."); Plugin.CallUpdateState(__instance, EnemyHunter.State.Leave); stateLeaveFailCounters.Remove(__instance.GetInstanceID()); return false; } Plugin.LogDebugF($"StateShootPrefix (Master): Standard Shot. Calling ShootRPC, Starting Reload & Transitioning to Idle."); Plugin.CallShootRPC(__instance); tracker.StartReload(); Plugin.CallUpdateState(__instance, EnemyHunter.State.Idle); return false; } // BLOCK ORIGINAL StateShoot
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               // --- Minigun Shoot Logic (Minigun ON) ---
-            else { if (tracker.IsReloading || tracker.IsInterrupted) { Plugin.LogDebugF($"StateShootPrefix(M) (Master): Blocked by Reload/Interrupt."); Plugin.CallAimLogic(__instance); return false; } if (!tracker.isMinigunBurstActive) { tracker.InitializeMinigunBurst(); ___stateTimer = tracker.ConfigMinigunShots * tracker.ConfigMinigunShotDelay + 1.0f; } tracker.minigunShotTimer -= Time.deltaTime; if (tracker.minigunShotTimer <= 0f && tracker.minigunShotsRemaining > 0) { if (!tracker.TryDecrementTotalAmmo()) { Plugin.LogInfoF($"StateShootPrefix(M) (Master): {__instance.gameObject.name} OOA mid-burst. End & Leave."); tracker.EndMinigunBurst(); Plugin.CallUpdateState(__instance, EnemyHunter.State.Leave); stateLeaveFailCounters.Remove(__instance.GetInstanceID()); return false; } Plugin.LogDebugF($"StateShootPrefix (Master): Fire minigun {tracker.ConfigMinigunShots - tracker.minigunShotsRemaining + 1}/{tracker.ConfigMinigunShots}. Ammo: {tracker.currentTotalAmmo}"); Plugin.CallShootRPC(__instance); tracker.minigunShotsRemaining--; tracker.minigunShotTimer = tracker.ConfigMinigunShotDelay; } if (tracker.minigunShotsRemaining <= 0 && tracker.isMinigunBurstActive) { Plugin.LogInfoF($"StateShootPrefix (Master): Minigun burst done. Transitioning to ShootEnd & Starting Reload."); tracker.EndMinigunBurst(); Plugin.CallUpdateState(__instance, EnemyHunter.State.ShootEnd); tracker.StartReload(); return false; } Plugin.CallAimLogic(__instance); return false; }
+            if (!Plugin.IsMinigunModeEnabled()) { if (!tracker.TryDecrementTotalAmmo()) { Plugin.LogInfoF($"StateShootPrefix(N) (Master): {__instance.gameObject.name} OOA this shot. Forcing Leave."); Plugin.CallUpdateState(__instance, EnemyHunter.State.Leave); stateLeaveFailCounters.Remove(__instance.GetInstanceID()); return false; } Plugin.LogDebugF($"StateShootPrefix (Master): Standard Shot. Calling ShootRPC, Starting Reload & Transitioning to Idle."); Plugin.CallShootRPC(__instance); tracker.StartReload(); Plugin.CallUpdateState(__instance, EnemyHunter.State.Idle); return false; }
+            else { if (tracker.IsReloading || tracker.IsInterrupted) { Plugin.LogDebugF($"StateShootPrefix(M) (Master): Blocked by Reload/Interrupt."); Plugin.CallAimLogic(__instance); return false; } if (!tracker.isMinigunBurstActive) { tracker.InitializeMinigunBurst(); } ___stateTimer = tracker.ConfigMinigunShotDelay + 0.1f; tracker.minigunShotTimer -= Time.deltaTime; if (tracker.minigunShotTimer <= 0f && tracker.minigunShotsRemaining > 0) { if (!tracker.TryDecrementTotalAmmo()) { Plugin.LogInfoF($"StateShootPrefix(M) (Master): {__instance.gameObject.name} OOA mid-burst. End & Leave."); tracker.EndMinigunBurst(); Plugin.CallUpdateState(__instance, EnemyHunter.State.Leave); stateLeaveFailCounters.Remove(__instance.GetInstanceID()); return false; } Plugin.LogDebugF($"StateShootPrefix (Master): Fire minigun {tracker.ConfigMinigunShots - tracker.minigunShotsRemaining + 1}/{tracker.ConfigMinigunShots}. Ammo: {tracker.currentTotalAmmo}"); Plugin.CallShootRPC(__instance); tracker.minigunShotsRemaining--; tracker.minigunShotTimer = tracker.ConfigMinigunShotDelay; } if (tracker.minigunShotsRemaining <= 0 && tracker.isMinigunBurstActive) { Plugin.LogInfoF($"StateShootPrefix (Master): Minigun burst done. Transitioning to ShootEnd & Starting Reload."); tracker.EndMinigunBurst(); Plugin.CallUpdateState(__instance, EnemyHunter.State.ShootEnd); tracker.StartReload(); return false; } Plugin.CallAimLogic(__instance); return false; }
         }
 
         // --- OnHurtPostfix ---
@@ -205,11 +219,7 @@ namespace HunterMod
 
 
         // --- PreventReEngagePrefix & Usages ---
-        static bool PreventReEngagePrefix(EnemyHunter __instance)
-        {
-            HunterAmmoTracker t = __instance?.GetComponent<HunterAmmoTracker>(); if (t != null && t.isOutOfAmmoPermanently) { Plugin.LogDebugF($"PreventReEngagePrefix: {__instance.gameObject.name} OOA (Synced). Prevent engage."); return false; }
-            return true;
-        }
+        static bool PreventReEngagePrefix(EnemyHunter __instance) { HunterAmmoTracker t = __instance?.GetComponent<HunterAmmoTracker>(); if (t != null && t.isOutOfAmmoPermanently) { Plugin.LogDebugF($"PreventReEngagePrefix: {__instance.gameObject.name} OOA (Synced). Prevent engage."); return false; } return true; }
         [HarmonyPatch(nameof(EnemyHunter.OnInvestigate))][HarmonyPrefix] static bool OnInvestigatePrefix(EnemyHunter __instance) => PreventReEngagePrefix(__instance);
         [HarmonyPatch(nameof(EnemyHunter.OnTouchPlayer))][HarmonyPrefix] static bool OnTouchPlayerPrefix(EnemyHunter __instance) => PreventReEngagePrefix(__instance);
         [HarmonyPatch(nameof(EnemyHunter.OnTouchPlayerGrabbedObject))][HarmonyPrefix] static bool OnTouchPlayerGrabbedObjectPrefix(EnemyHunter __instance) => PreventReEngagePrefix(__instance);
