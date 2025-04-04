@@ -1,6 +1,6 @@
 # Hunter Enhancements Mod for R.E.P.O.
 
-([https://gcdn.thunderstore.io/live/repository/icons/randomlygenerated-Hunter_Enhancements-1.0.11.png.128x128_q95.jpg])
+[![Thunderstore Version](https://img.shields.io/thunderstore/v/randomlygenerated/Hunter_Enhancements?color=success&label=Thunderstore)](https://thunderstore.io/c/repo/p/randomlygenerated/Hunter_Enhancements/)
 
 **Current Version:** 1.6.1
 
